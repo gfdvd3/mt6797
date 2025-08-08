@@ -1,0 +1,136 @@
+name: Build MT6797 NetHunter Kernel (Bluetooth Support)
+
+on:
+  push:
+    branches: [ cm-14.1-old ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-20.04
+    
+    steps:
+      - name: 检查内核代码
+        uses: actions/checkout@v4
+        with:
+          ref: cm-14.1-old
+          path: kernel
+
+      - name: 克隆NetHunter补丁（含蓝牙相关补丁）
+        uses: actions/checkout@v4
+        with:
+          repository: p3h3n9-pr0j3ct/NetHunter-patch
+          path: nethunter-patch
+          ref: master
+
+      - name: 安装依赖
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            build-essential ncurses-dev xz-utils flex bison openssl \
+            libssl-dev libelf-dev libudev-dev libpci-dev libiberty-dev \
+            autoconf wget unzip zip patch
+
+      - name: 配置Android NDK
+        run: |
+          wget https://dl.google.com/android/repository/android-ndk-r14b-linux-x86_64.zip -O ndk.zip
+          unzip -q ndk.zip
+          echo "NDK_PATH=$(pwd)/android-ndk-r14b" >> $GITHUB_ENV
+          echo "$(pwd)/android-ndk-r14b/toolchains/aarch64-linux-android-4.9/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+
+      - name: 优先应用蓝牙相关补丁
+        run: |
+          cd kernel
+          # 应用蓝牙补丁（从NetHunter-patch/3.18中筛选）
+          # 修复蓝牙SCO音频和指针类型错误的补丁
+          for bt_patch in ../nethunter-patch/3.18/fix-bt-sco-3.18.patch ../nethunter-patch/3.18/fix-incompatible-pointer-type-error-in-btusb.c-3.18.patch; do
+            if [ -f "$bt_patch" ]; then
+              echo "Applying Bluetooth patch: $bt_patch"
+              patch -p1 < "$bt_patch" || { echo "Bluetooth patch $bt_patch failed!"; exit 1; }
+            fi
+          done
+
+      - name: 应用其他NetHunter补丁
+        run: |
+          cd kernel
+          # 应用剩余补丁（排除已单独处理的蓝牙补丁）
+          for patch in ../nethunter-patch/3.18/*.patch; do
+            if [[ "$patch" != *"fix-bt-sco"* && "$patch" != *"fix-incompatible-pointer-type-error-in-btusb.c"* ]]; then
+              echo "Applying patch: $patch"
+              patch -p1 < "$patch" || { echo "Patch $patch failed!"; exit 1; }
+            fi
+          done
+
+      - name: 配置内核选项（增强蓝牙支持）
+        run: |
+          cd kernel
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-android- lineage_gemini_defconfig
+          
+          # 启用NetHunter蓝牙必需配置
+          echo '
+          # 蓝牙核心功能
+          CONFIG_BT=y
+          CONFIG_BT_HCI=y
+          CONFIG_BT_HCI_USB=y  # 支持USB蓝牙适配器
+          CONFIG_BT_HCI_UART=y  # 支持UART蓝牙模块
+          CONFIG_BT_RFCOMM=y  # 蓝牙串口协议（用于设备连接）
+          CONFIG_BT_RFCOMM_TTY=y  # 蓝牙TTY支持
+          CONFIG_BT_BNEP=y  # 蓝牙网络封装协议
+          CONFIG_BT_BNEP_MC_FILTER=y
+          CONFIG_BT_BNEP_PROTO_FILTER=y
+          CONFIG_BT_HIDP=y  # 蓝牙HID协议（支持键盘/鼠标模拟）
+          
+          # 蓝牙调试与高级功能
+          CONFIG_BT_DEBUG=y  # 蓝牙调试日志
+          CONFIG_BT_SELFTEST=y  # 蓝牙自检工具
+          CONFIG_BT_HCI_DTLM=y  # 蓝牙诊断模式
+          
+          # 原有NetHunter功能配置
+          CONFIG_PACKET=y
+          CONFIG_CFG80211=y
+          CONFIG_MAC80211=y
+          CONFIG_USB_GADGET=y
+          CONFIG_MODULES=y
+          CONFIG_DEBUG_FS=y
+          ' >> .config
+          
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-android- olddefconfig
+
+      - name: 编译内核
+        run: |
+          cd kernel
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-android- -j$(nproc)
+
+      - name: 用AnyKernel3打包（含蓝牙模块）
+        run: |
+          git clone https://github.com/osm0sis/AnyKernel3.git
+          cd AnyKernel3
+          
+          # 复制内核镜像、设备树和蓝牙相关模块
+          cp ../kernel/arch/arm64/boot/Image kernel/Image
+          cp ../kernel/arch/arm64/boot/dts/*.dtb dtb/
+          # 确保蓝牙模块被打包（如btusb.ko等）
+          mkdir -p modules
+          cp ../kernel/drivers/bluetooth/*.ko modules/  # 蓝牙驱动模块
+          
+          # 配置AnyKernel3脚本
+          echo "
+          kernel.string=MT6797 NetHunter Kernel (Bluetooth Enabled)
+          do.devicecheck=1
+          device.name1=gemini
+          do.modules=1
+          module.copy=modules/* /system/lib/modules/
+          module.copy=../kernel/lib/modules/* /system/lib/modules/
+          block=boot
+          " > anykernel.sh
+          
+          zip -r9 ../mt6797-nethunter-bt.zip *
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: mt6797-nethunter-bluetooth
+          path: |
+            mt6797-nethunter-bt.zip
+            kernel/arch/arm64/boot/Image
+            kernel/.config
